@@ -1,6 +1,6 @@
 import numpy as np
 
-
+# ========= Pretty-print =========
 def print_matrix(M, title=None, fmt="{:10.6f}"):
     if title:
         print(title)
@@ -8,13 +8,22 @@ def print_matrix(M, title=None, fmt="{:10.6f}"):
         print(" ".join(fmt.format(x) for x in row))
     print()
 
-def print_interval_matrix(A0, eps, fmt="[{:.6f},{:.6f}]"):
+def print_interval_matrix(A0, eps, fmt="[{:.6f},{:.6f}]", mode="tomo"):
+    """
+    mode="tomo":    radA = eps * [[1,1],[1,1],...]
+    mode="regress": radA = eps * [[1,0],[1,0],...]  
+    """
     for row in A0:
         a, b = row
-        print(fmt.format(a - eps, a + eps), fmt.format(b - eps, b + eps))
+        if mode == "tomo":
+            print(fmt.format(a - eps, a + eps), fmt.format(b - eps, b + eps))
+        elif mode == "regress":
+            print(fmt.format(a - eps, a + eps), fmt.format(b, b))
+        else:
+            raise ValueError("Unknown mode")
     print()
 
-def debug_step(A0, eps, eps_range, step_id, phase=""):
+def debug_step(A0, eps, eps_range, step_id, phase="", mode="tomo"):
     print(f"step = {step_id}" + (f"  ({phase})" if phase else ""))
     if eps_range is not None:
         l, r = eps_range
@@ -23,7 +32,7 @@ def debug_step(A0, eps, eps_range, step_id, phase=""):
         print("epsilon = (Not defined)")
     print(f"epsilon = {eps:.6f}")
     print("A(eps):")
-    print_interval_matrix(A0, eps)
+    print_interval_matrix(A0, eps, mode=mode)
 
 # ====== Interval helpers & collinearity parts 
 def interval_div_positive(u_min, u_max, v_min, v_max):
@@ -40,22 +49,54 @@ def interval_intersection(a_min, a_max, b_min, b_max, tol=0.0):
     if lo <= hi + tol: return (lo, hi)
     return None
 
-def lambda_interval_for_eps(A0, eps, require_pos_den=True, verbose=False):
+# ---- NEW: helper to get (U,V) per-row depending on mode
+def row_intervals(a_i, b_i, eps, mode):
+    """
+    Returns:
+      U = interval for column 1 (a_i)
+      V = interval for column 2 (b_i)
+    """
+    if mode == "tomo":
+        # both columns vary by ±eps
+        U = (a_i - eps, a_i + eps)
+        V = (b_i - eps, b_i + eps)
+    elif mode == "regress":
+        # only first column varies; second column fixed
+        U = (a_i - eps, a_i + eps)
+        V = (b_i, b_i)
+    else:
+        raise ValueError("Unknown mode")
+    return U, V
+
+def lambda_interval_for_eps(A0, eps, require_pos_den=True, verbose=False, mode="tomo"):
     a = A0[:, 0].astype(float)
     b = A0[:, 1].astype(float)
-    if require_pos_den and np.any(b - eps <= 0):
-        return None, []
+
+    # quick positivity check for denominators in "regress" (degenerate V)
+    if require_pos_den and mode == "regress":
+        # V = [b_i, b_i] => b_i > 0 with each i
+        if np.any(b <= 0):
+            return None, []
+
     lam_l, lam_r = -np.inf, np.inf
     steps = []
     for i in range(len(a)):
-        u_min, u_max = a[i] - eps, a[i] + eps
-        v_min, v_max = b[i] - eps, b[i] + eps
+        U, V = row_intervals(a[i], b[i], eps, mode)
+        u_min, u_max = U
+        v_min, v_max = V
+
         if require_pos_den:
+            # if V have 0 fail
+            if v_min <= 0:
+                # mode="tomo" v_min>0 ⇒ (b_i - eps) > 0
+                # mode="regress" v_min=v_max=b_i > 0 
+                return None, steps
             lo, hi = interval_div_positive(u_min, u_max, v_min, v_max)
         else:
             if v_min <= 0 <= v_max:
                 return None, steps
             lo, hi = interval_div_positive(u_min, u_max, v_min, v_max)
+
         lam_l = max(lam_l, lo); lam_r = min(lam_r, hi)
         steps.append({"row": i, "U": (u_min, u_max), "V": (v_min, v_max),
                       "U_div_V": (lo, hi), "lam_running": (lam_l, lam_r)})
@@ -63,68 +104,77 @@ def lambda_interval_for_eps(A0, eps, require_pos_den=True, verbose=False):
             return None, steps
     return (lam_l, lam_r), steps
 
-def construct_degenerate_matrix(A0, eps, lam, tol=1e-12, verbose=False):
+def construct_degenerate_matrix(A0, eps, lam, tol=1e-12, verbose=False, mode="tomo"):
     a = A0[:, 0].astype(float); b = A0[:, 1].astype(float)
     m = len(a); u = np.zeros(m); v = np.zeros(m)
     for i in range(m):
-        U = (a[i] - eps, a[i] + eps)
-        V = (b[i] - eps, b[i] + eps)
-        WV = interval_scale(lam, V[0], V[1])
+        U, V = row_intervals(a[i], b[i], eps, mode)
+        WV = interval_scale(lam, V[0], V[1])        # lam * V interval
         I  = interval_intersection(U[0], U[1], WV[0], WV[1], tol=1e-12)
         if I is None: return None
         u_i = 0.5 * (I[0] + I[1])
-        v_i = u_i / lam if abs(lam) > tol else 0.0
+        if abs(lam) > tol:
+            v_i = u_i / lam
+        else:
+            v_i = 0.0
+        # clamp v_i into V interval (even if V is degenerate)
         v_i = min(max(v_i, V[0]), V[1])
         u[i], v[i] = u_i, v_i
     return np.column_stack([u, v])
 
-def cols_are_collinear(A0, eps, verbose=False):
-    lam_rng, steps = lambda_interval_for_eps(A0, eps, require_pos_den=True, verbose=verbose)
+def cols_are_collinear(A0, eps, verbose=False, mode="tomo"):
+    lam_rng, steps = lambda_interval_for_eps(A0, eps, require_pos_den=True, verbose=verbose, mode=mode)
     if lam_rng is None: return False, None, steps
     return True, lam_rng, steps
 
-
-def epsilon_star_3x2(A0, delta=1e-4, eps_init=0.05, eps_max=0.99, verbose=True):
+def epsilon_star_3x2(A0, delta=1e-4, eps_init=0.05, eps_max=0.99, verbose=True, mode="tomo"):
+    """
+    mode="tomo":    radA = eps * [[1,1],[1,1],...]
+    mode="regress": radA = eps * [[1,0],[1,0],...]
+    """
     step_id = 0
 
-    ok0, lam_rng0, _ = cols_are_collinear(A0, 0.0, verbose=verbose)
+    # Check eps=0
+    ok0, lam_rng0, _ = cols_are_collinear(A0, 0.0, verbose=verbose, mode=mode)
     if ok0:
         if verbose:
-            debug_step(A0, 0.0, (0.0, 0.0), step_id, phase="initial")
+            debug_step(A0, 0.0, (0.0, 0.0), step_id, phase="initial", mode=mode)
         lam_star = lam_rng0[0] if lam_rng0 else 1.0
-        M0 = construct_degenerate_matrix(A0, 0.0, lam_star, verbose=verbose)
+        M0 = construct_degenerate_matrix(A0, 0.0, lam_star, verbose=verbose, mode=mode)
         return 0.0, M0, lam_star
 
+    # expand right bound
     left, right = 0.0, eps_init
-    ok, lam_rng, _ = cols_are_collinear(A0, right, verbose=verbose)
+    ok, lam_rng, _ = cols_are_collinear(A0, right, verbose=verbose, mode=mode)
     while not ok and right < eps_max:
         left = right
         right *= 2
-        ok, lam_rng, _ = cols_are_collinear(A0, right, verbose=verbose)
+        ok, lam_rng, _ = cols_are_collinear(A0, right, verbose=verbose, mode=mode)
         if verbose:
             step_id += 1
-            debug_step(A0, right, (left, right), step_id, phase="expand")
+            debug_step(A0, right, (left, right), step_id, phase="expand", mode=mode)
 
     if not ok:
         return None, None, None
 
+    # bisection
     while right - left > delta:
         mid = (left + right) / 2.0
-        ok, lam_rng, _ = cols_are_collinear(A0, mid, verbose=verbose)
+        ok, lam_rng, _ = cols_are_collinear(A0, mid, verbose=verbose, mode=mode)
         if ok:
             right = mid
         else:
             left = mid
         if verbose:
             step_id += 1
-            debug_step(A0, mid, (left, right), step_id, phase="bisection")
+            debug_step(A0, mid, (left, right), step_id, phase="bisection", mode=mode)
 
-    lam_rng_final, _ = lambda_interval_for_eps(A0, right, verbose=verbose)
+    lam_rng_final, _ = lambda_interval_for_eps(A0, right, verbose=verbose, mode=mode)
     lam_star = lam_rng_final[0]
-    M_star = construct_degenerate_matrix(A0, right, lam_star, verbose=verbose)
+    M_star = construct_degenerate_matrix(A0, right, lam_star, verbose=verbose, mode=mode)
     if M_star is None and lam_rng_final is not None:
         lam_star = lam_rng_final[1]
-        M_star = construct_degenerate_matrix(A0, right, lam_star, verbose=verbose)
+        M_star = construct_degenerate_matrix(A0, right, lam_star, verbose=verbose, mode=mode)
 
     return right, M_star, lam_star
 
@@ -136,11 +186,22 @@ if __name__ == "__main__":
         [1.20, 1.00]
     ], dtype=float)
 
-    eps_star, M_star, lam_star = epsilon_star_3x2(A0, delta=1e-5, eps_init=0.05, verbose=True)
+    print("=== TOMO ===")
+    eps_star, M_star, lam_star = epsilon_star_3x2(A0, delta=1e-5, eps_init=0.05, verbose=True, mode="tomo")
     if eps_star is None:
         print("Не найден eps.")
     else:
         print(f"\nε* ≈ {eps_star:.6f},  λ* ≈ {lam_star:.6f}")
-        print_interval_matrix(A0, eps_star)
+        print_interval_matrix(A0, eps_star, mode="tomo")
         if M_star is not None:
-            print_matrix(M_star, title="M*:")
+            print_matrix(M_star, title="M* (tomo):")
+
+    print("=== REGRESS ===")
+    eps_star_r, M_star_r, lam_star_r = epsilon_star_3x2(A0, delta=1e-5, eps_init=0.05, verbose=True, mode="regress")
+    if eps_star_r is None:
+        print("Не найден eps (regress).")
+    else:
+        print(f"\nε* ≈ {eps_star_r:.6f},  λ* ≈ {lam_star_r:.6f}")
+        print_interval_matrix(A0, eps_star_r, mode="regress")
+        if M_star_r is not None:
+            print_matrix(M_star_r, title="M* (regress):")
