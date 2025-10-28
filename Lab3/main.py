@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from tol import tolsolvty
 import math
 import os
-
+from test import optimal_Ab, to_bounds
 ip.precision.extendedPrecisionQ = False
 
 
@@ -223,7 +223,7 @@ A3 = ip.Interval([
     [[0.65, 1.25], [0.70, 1.3]],
     [[0.75, 1.35], [0.70, 1.3]],
     [[0.8, 1.4], [0.70, 1.3]],
-    [[0.3, 0.3], [0.70, 1.3]]
+    [[-0.3, 0.3], [0.70, 1.3]]
 ])
 
 b3 = ip.Interval([
@@ -242,35 +242,39 @@ bs = [b1, b2, b3]
 
 def run(correction=None):
     match correction:
-        # ==============================================================
-        # 1️⃣  Trường hợp Ab-correction
-        # ==============================================================
         case "Ab":
             print("____Ab-correction____")
-            for i in range(len(As)):
+            for i, (A_, b_) in enumerate(zip(As, bs)):
                 print(f"\n=== System {i + 1} ===")
-                A_ = As[i]
-                b_ = bs[i]
 
-                # Hiệu chỉnh
-                A_, b_ = Ab_correction(A_, b_)
+                # --- Lấy mid và rad ---
+                midA, radA = ip.mid(A_), ip.rad(A_)
+                midb, radb = ip.mid(b_), ip.rad(b_)
 
-                emptiness_, maxX, maxTol = is_empty(A_, b_)
-                print(f"Tol max = {maxTol:.6f}, argmax = {maxX}")
-        
+                # --- Tìm alpha*, beta* tối ưu ---
+                α_star, β_star, Tol_star = optimal_Ab(midA, radA, midb, radb)
+                if α_star is None:
+                    print("⚠️  Hệ này không đạt Tol ≥ 0 trong miền tìm kiếm.")
+                    continue
+
+                print(f"α* (radA scale) = {α_star:.3f}")
+                print(f"β* (radb scale) = {β_star:.3f}")
+                print(f"Tol_final       = {Tol_star:.6f}")
+
+                # --- Áp dụng hiệu chỉnh ---
+                A_corr = ip.Interval(np.stack((midA - α_star*radA, midA + α_star*radA), axis=-1))
+                b_corr = ip.Interval(np.stack((midb - β_star*radb, midb + β_star*radb), axis=-1))
+
                 tolmax, argmax, envs, ccode = tolsolvty(
-                    infA=ip.inf(A_), supA=ip.sup(A_),
-                    infb=ip.inf(b_).reshape(-1, 1),
-                    supb=ip.sup(b_).reshape(-1, 1)
+                    infA=ip.inf(A_corr), supA=ip.sup(A_corr),
+                    infb=ip.inf(b_corr).reshape(-1, 1),
+                    supb=ip.sup(b_corr).reshape(-1, 1)
                 )
                 print(f"[tolsovlty] Tolmax={tolmax:.6f}, argmax={argmax.ravel()}")
-                print(A_)
-                print(b_)
-                visualize_tol(A_, b_, f"Ab-correction_{i + 1}")
+                print(A_corr)
+                print(b_corr)
 
-        # ==============================================================
-        # 2️⃣  Trường hợp chỉ hiệu chỉnh A
-        # ==============================================================
+                visualize_tol(A_corr, b_corr, f"Ab-correction_{i + 1}")
         case "A":
             print("____A-correction____")
             for i in range(len(As)):
@@ -281,7 +285,7 @@ def run(correction=None):
 
                 emptiness_, maxX, maxTol = is_empty(A_, b_)
                 print(f"After A-correction: Tol = {maxTol:.6f}, argmax = {maxX}")
-
+                print(A_)
 
                 tolmax, argmax, envs, ccode = tolsolvty(
                     infA=ip.inf(A_), supA=ip.sup(A_),
@@ -291,9 +295,6 @@ def run(correction=None):
                 print(f"[tolsovlty] Tolmax={tolmax:.6f}, argmax={argmax.ravel()}")
                 visualize_tol(A_, b_, f"A-correction_{i + 1}")
 
-        # ==============================================================
-        # 3️⃣  Trường hợp chỉ hiệu chỉnh b
-        # ==============================================================
         case "b":
             print("____b-correction____")
             for i in range(len(As)):
@@ -318,9 +319,6 @@ def run(correction=None):
                 
                 visualize_tol(A_, b_, f"b-correction_{i + 1}")
 
-        # ==============================================================
-        # 4️⃣  Không hiệu chỉnh
-        # ==============================================================
         case None:
             print("____Without correction____")
             for i in range(len(As)):
@@ -339,4 +337,42 @@ def run(correction=None):
 #run()
 #run("A")
 #run("b")
-run("Ab")
+#run("Ab")
+def A_correction_slide(A, b, e_values):
+    """
+    Thử nhiều giá trị e và quan sát thay đổi Tol(A(e), b)
+    """
+    tol_values = []
+    for e in e_values:
+        # tạo ma trận A được hiệu chỉnh
+        corrected_A = []
+        for i in range(len(A)):
+            row = []
+            for j in range(len(A[0])):
+                if ip.rad(A[i][j]) == 0:
+                    row.append([A[i][j]._a, A[i][j]._b])
+                else:
+                    row.append([A[i][j]._a + e, A[i][j]._b - e])
+            corrected_A.append(row)
+
+        A_e = ip.Interval(corrected_A)
+        # tính Tol cho giá trị e này
+        tol = ip.linear.Tol.maximize(A_e, b)
+        tol_values.append(tol[1])  # Tolmax
+
+    return tol_values
+
+
+# ví dụ sử dụng
+e_values = np.linspace(0.0, 1.0, 100)
+tol_values = A_correction_slide(A2, b2, e_values)
+idx_max = np.argmax(tol_values)
+e_opt = e_values[idx_max]
+tol_opt = tol_values[idx_max]
+print(e_opt, tol_opt)
+plt.plot(e_values, tol_values)
+plt.xlabel("e (коэффициент сужения)")
+plt.ylabel("Tol(A_3(e), b)")
+plt.title("Зависимость Tol от параметра e")
+plt.grid(True)
+plt.show()
